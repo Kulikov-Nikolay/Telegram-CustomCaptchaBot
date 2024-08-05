@@ -4,6 +4,8 @@ import html
 import json
 import traceback
 import logging
+import datetime
+import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue, CallbackQueryHandler
 from telegram.error import TelegramError, BadRequest
@@ -391,6 +393,41 @@ Current settings for this chat:
     except Error as e:
         print(f"Error getting all settings: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the settings. Please try again later.")
+    finally:
+        cursor.close()
+        connection.close()
+
+async def update_group_statistics(context: ContextTypes.DEFAULT_TYPE) -> None:
+    bot = context.bot
+    connection = get_db_connection()
+    if connection is None:
+        print("Failed to connect to the database")
+        return
+
+    cursor = connection.cursor()
+    try:
+        # Get all unique chat_ids from the chat_settings table
+        cursor.execute("SELECT DISTINCT chat_id FROM chat_settings")
+        chat_ids = cursor.fetchall()
+
+        for (chat_id,) in chat_ids:
+            try:
+                # Get the member count for the chat
+                chat_member_count = await bot.get_chat_member_count(chat_id)
+
+                # Insert the data into the group_statistics table
+                cursor.execute("""
+                    INSERT INTO group_statistics (chat_id, member_count)
+                    VALUES (%s, %s)
+                """, (chat_id, chat_member_count))
+
+                print(f"Updated statistics for chat {chat_id}: {chat_member_count} members")
+            except TelegramError as e:
+                print(f"Error getting member count for chat {chat_id}: {e}")
+
+        connection.commit()
+    except Error as e:
+        print(f"Database error in update_group_statistics: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -1157,6 +1194,10 @@ def main() -> None:
             job_queue.run_repeating(cleanup_pending_captchas, interval=3600, first=10)
         else:
             print("Warning: Job queue is not available. Scheduled tasks will not run.")
+
+        # Schedule the group statistics update job to run once per day
+        if job_queue:
+        job_queue.run_daily(update_group_statistics, time=datetime.time(hour=0, minute=0, tzinfo=pytz.UTC))
 
         # Start the Bot
         print("Starting the bot...")
