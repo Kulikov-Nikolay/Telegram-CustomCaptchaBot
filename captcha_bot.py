@@ -1189,15 +1189,13 @@ def main() -> None:
         # Handle edited messages for commands
         application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, handle_edited_command))
 
-        # Schedule the cleanup job to run every hour
+         # Schedule the cleanup job to run every hour
         if job_queue:
             job_queue.run_repeating(cleanup_pending_captchas, interval=3600, first=10)
+            # Schedule the group statistics update job to run once per day
+            job_queue.run_daily(update_group_statistics, time=datetime.time(hour=0, minute=0, tzinfo=pytz.UTC))
         else:
             print("Warning: Job queue is not available. Scheduled tasks will not run.")
-
-        # Schedule the group statistics update job to run once per day
-        if job_queue:
-        job_queue.run_daily(update_group_statistics, time=datetime.time(hour=0, minute=0, tzinfo=pytz.UTC))
 
         # Start the Bot
         print("Starting the bot...")
