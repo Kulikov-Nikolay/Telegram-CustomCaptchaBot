@@ -28,9 +28,6 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 logger = logging.getLogger(__name__)
 
-# Define your DEVELOPER_CHAT_ID here
-DEVELOPER_CHAT_ID = -1002186560124  # Replace with your actual chat ID
-
 # Store pending captchas: {user_id: correct_answer}
 pending_captchas = {}
 
@@ -1116,76 +1113,58 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
-    logger.error("Exception while handling an update:", exc_info=context.error)
-
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = ''.join(tb_list)
-
-    message = (
-        f'An exception was raised while handling an update\n'
-        f'<pre>update = {html.escape(str(update))}</pre>\n\n'
-        f'<pre>context.chat_data = {html.escape(str(context.chat_data))}</pre>\n\n'
-        f'<pre>context.user_data = {html.escape(str(context.user_data))}</pre>\n\n'
-        f'<pre>{html.escape(tb_string)}</pre>'
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=DEVELOPER_CHAT_ID,
-            text=message,
-            parse_mode=ParseMode.HTML
-        )
-    except BadRequest as e:
-        logger.error(f"Failed to send error message to developer: {e}")
-        logger.error(f"Original error: {message}")
-
 def main() -> None:
     """Start the bot."""
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    try:
+        # Create the Application and pass it your bot's token.
+        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("settimeout", set_timeout))
-    application.add_handler(CommandHandler("gettimeout", get_timeout))
-    application.add_handler(CommandHandler("setattemptlimit", set_attempt_limit))
-    application.add_handler(CommandHandler("getattemptlimit", get_attempt_limit))
-    application.add_handler(CommandHandler("setopencaptcha", set_open_captcha))
-    application.add_handler(CommandHandler("setmultiplechoice", set_multiple_captcha))
-    application.add_handler(CommandHandler("setwelcomemessage", set_welcome_message))
-    application.add_handler(CommandHandler("getwelcomemessage", get_welcome_message))
-    application.add_handler(CommandHandler("setstrictmode", set_strict_mode))
-    application.add_handler(CommandHandler("unsetstrictmode", unset_strict_mode))
-    application.add_handler(CommandHandler("getallsettings", get_all_settings))
-    application.add_handler(CommandHandler("setwelcometimeout", set_welcome_timeout))
-    application.add_handler(CommandHandler("getwelcometimeout", get_welcome_timeout))
-    application.add_handler(CommandHandler("checkpermissions", check_permissions))
+        # Set up the job queue
+        job_queue = application.job_queue
 
-    # Handle new chat members
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member))
+        # Command handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("settimeout", set_timeout))
+        application.add_handler(CommandHandler("gettimeout", get_timeout))
+        application.add_handler(CommandHandler("setattemptlimit", set_attempt_limit))
+        application.add_handler(CommandHandler("getattemptlimit", get_attempt_limit))
+        application.add_handler(CommandHandler("setopencaptcha", set_open_captcha))
+        application.add_handler(CommandHandler("setmultiplechoice", set_multiple_captcha))
+        application.add_handler(CommandHandler("setwelcomemessage", set_welcome_message))
+        application.add_handler(CommandHandler("getwelcomemessage", get_welcome_message))
+        application.add_handler(CommandHandler("setstrictmode", set_strict_mode))
+        application.add_handler(CommandHandler("unsetstrictmode", unset_strict_mode))
+        application.add_handler(CommandHandler("getallsettings", get_all_settings))
+        application.add_handler(CommandHandler("checkpermissions", check_permissions))
+        application.add_handler(CommandHandler("setwelcometimeout", set_welcome_timeout))
+        application.add_handler(CommandHandler("getwelcometimeout", get_welcome_timeout))
 
-    # Handle captcha button callbacks
-    application.add_handler(CallbackQueryHandler(button_callback, pattern="^captcha:"))
+        # Handle new chat members
+        application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_member))
 
-    # Handle text messages (for open-ended captchas)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_captcha_answer))
+        # Handle captcha button callbacks
+        application.add_handler(CallbackQueryHandler(button_callback, pattern="^captcha:"))
 
-    # Handle edited messages for commands
-    application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, handle_edited_command))
+        # Handle text messages (for open-ended captchas)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_captcha_answer))
 
-    # Schedule the cleanup job to run every hour
-    job_queue = application.job_queue
-    job_queue.run_repeating(cleanup_pending_captchas, interval=3600, first=10)
+        # Handle edited messages for commands
+        application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, handle_edited_command))
 
-    # Set up error handler
-    application.add_error_handler(error_handler)
+        # Schedule the cleanup job to run every hour
+        if job_queue:
+            job_queue.run_repeating(cleanup_pending_captchas, interval=3600, first=10)
+        else:
+            print("Warning: Job queue is not available. Scheduled tasks will not run.")
 
-    # Start the Bot
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Start the Bot
+        print("Starting the bot...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    except Exception as e:
+        print(f"Error starting the bot: {e}")
+        raise  # Re-raise the exception to ensure the service fails and logs the error
 
 if __name__ == '__main__':
     main()
-
