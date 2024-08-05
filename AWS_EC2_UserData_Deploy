@@ -1,0 +1,66 @@
+#!/bin/bash
+
+# Update the system
+yum update -y
+
+# Install Python 3, pip, git, and AWS CLI
+yum install -y python3 python3-pip git awscli
+
+# Clone the GitHub repository (If you've done a fork, replace the URL with your own repository)
+git clone https://github.com/Kulikov-Nikolay/Telegram-CustomCaptchaBot /opt/telegram-captcha-bot
+
+# Change to the bot directory
+cd /opt/telegram-captcha-bot
+
+# Install Python dependencies
+pip3 install -r requirements.txt
+
+# Fetch sensitive information from Parameter Store (You have to create entries in AWS Parameter Store with sensitive data (with the names as below. e.g. "/telegram-bot/bot-token", "/telegram-bot/db-host", etc) and make sure that an EC2 instance can read it. To do this add IAM Role "AmazonSSMReadOnlyAccess" to the instance)
+TELEGRAM_BOT_TOKEN=$(aws ssm get-parameter --name "/telegram-bot/bot-token" --with-decryption --query Parameter.Value --output text)
+DB_HOST=$(aws ssm get-parameter --name "/telegram-bot/db-host" --with-decryption --query Parameter.Value --output text)
+DB_PORT=$(aws ssm get-parameter --name "/telegram-bot/db-port" --with-decryption --query Parameter.Value --output text)
+DB_NAME=$(aws ssm get-parameter --name "/telegram-bot/db-name" --with-decryption --query Parameter.Value --output text)
+DB_USER=$(aws ssm get-parameter --name "/telegram-bot/db-user" --with-decryption --query Parameter.Value --output text)
+DB_PASSWORD=$(aws ssm get-parameter --name "/telegram-bot/db-password" --with-decryption --query Parameter.Value --output text)
+
+# Create the .env file with environment variables
+cat <<EOT > /opt/telegram-captcha-bot/.env
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+DB_HOST=$DB_HOST
+DB_PORT=$DB_PORT
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASSWORD=$DB_PASSWORD
+EOT
+
+# Set correct permissions for the .env file
+chmod 600 /opt/telegram-captcha-bot/.env
+chown ec2-user:ec2-user /opt/telegram-captcha-bot/.env
+
+# Create the service file
+cat <<EOT > /etc/systemd/system/telegram-captcha-bot.service
+[Unit]
+Description=Telegram Captcha Bot
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/telegram-captcha-bot/captcha_bot.py
+WorkingDirectory=/opt/telegram-captcha-bot
+Restart=always
+User=ec2-user
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+# Set correct permissions for the service file
+chmod 644 /etc/systemd/system/telegram-captcha-bot.service
+
+# Reload systemd, enable and start the service
+systemctl daemon-reload
+systemctl enable telegram-captcha-bot
+systemctl start telegram-captcha-bot
+
+# Output the service status for debugging
+systemctl status telegram-captcha-bot
