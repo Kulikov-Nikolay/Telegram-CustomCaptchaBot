@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import TelegramError, BadRequest
 from telegram.constants import ParseMode
 from collections import defaultdict
+from datetime import time as dt_time
 from datetime import datetime, timedelta
 
 import os
@@ -648,38 +649,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 connection.commit()
 
                 if new_attempts >= attempt_limit:
-                    try:
-                        if strict_mode:
-                            await context.bot.ban_chat_member(chat_id, user_id)
-                            action_text = "banned permanently"
-                        else:
-                            await context.bot.ban_chat_member(chat_id, user_id)
-                            await context.bot.unban_chat_member(chat_id, user_id)
-                            action_text = "removed"
-
-                        removal_message = await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"{query.from_user.full_name} has been {action_text} for exceeding the maximum number of incorrect attempts."
-                        )
-
-                        # Wait for a short time to allow system messages to appear
-                        await asyncio.sleep(2)
-
-                        # Try to delete system messages and bot messages
-                        messages_to_delete = [captcha_message_id, removal_message.message_id]
-                        for i in range(5):  # Try to delete up to 5 messages after the captcha message
-                            messages_to_delete.append(captcha_message_id + i)
-
-                        for msg_id in messages_to_delete:
-                            try:
-                                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                            except TelegramError:
-                                pass  # If we can't delete a message, just move on to the next one
-
-                        cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
-                        connection.commit()
-                    except TelegramError as e:
-                        print(f"Error kicking/banning user {user_id} from chat {chat_id}: {e}")
+                    # Schedule the kick job immediately
+                    context.job_queue.run_once(
+                        kick_user,
+                        0,  # Run immediately
+                        data={
+                            'chat_id': chat_id,
+                            'user_id': user_id,
+                            'user_name': query.from_user.full_name,
+                            'captcha_message_id': captcha_message_id,
+                            'strict_mode': strict_mode
+                        },
+                        name=f'kick_user_{chat_id}_{user_id}'
+                    )
                 else:
                     remaining_attempts = attempt_limit - new_attempts
                     await query.edit_message_text(
@@ -709,12 +691,11 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         if not pending_captcha:
             return  # No pending captcha for this user
 
-        messages_to_delete = json.loads(pending_captcha.get('messages_to_delete', '[]'))
-        messages_to_delete.append(update.message.message_id)  # Add the current message to the list
-
         chat_id = pending_captcha['chat_id']
         captcha_message_id = pending_captcha['captcha_message_id']
         correct_answers = pending_captcha['correct_answers'].split(',')
+        messages_to_delete = json.loads(pending_captcha.get('messages_to_delete', '[]'))
+        messages_to_delete.append(update.message.message_id)
 
         cursor.execute("SELECT * FROM chat_settings WHERE chat_id = %s", (chat_id,))
         chat_settings = cursor.fetchone()
@@ -728,28 +709,29 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         if user_answer in [ans.lower() for ans in correct_answers]:
             success_message = await update.message.reply_text(f"Correct! {welcome_message}")
             messages_to_delete.append(success_message.message_id)
+            cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
+            connection.commit()
 
             # Remove the kick job if it exists
             current_jobs = context.job_queue.get_jobs_by_name(f'kick_user_{chat_id}_{user_id}')
             for job in current_jobs:
                 job.schedule_removal()
 
-            # Schedule message deletion
+            # Schedule welcome message deletion
             context.job_queue.run_once(
-                delete_captcha_messages, 
+                delete_welcome_message, 
                 welcome_timeout,
-                data={
-                    'chat_id': chat_id, 
-                    'user_id': user_id, 
-                    'messages_to_delete': messages_to_delete
-                },
-                name=f'delete_captcha_{chat_id}_{user_id}'
+                data={'chat_id': chat_id, 'message_id': success_message.message_id},
+                name=f'delete_welcome_{chat_id}_{user_id}'
             )
 
-            # Remove the pending captcha from the database
-            cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
-            connection.commit()
-
+            # Schedule captcha-related message deletion
+            context.job_queue.run_once(
+                delete_captcha_messages, 
+                15, 
+                data={'chat_id': chat_id, 'user_id': user_id, 'message_ids': messages_to_delete},
+                name=f'delete_captcha_{chat_id}_{user_id}'
+            )
         else:
             new_attempts = pending_captcha['attempts'] + 1
             
@@ -764,7 +746,7 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
                         'user_name': update.message.from_user.full_name,
                         'captcha_message_id': captcha_message_id,
                         'strict_mode': strict_mode,
-                        'messages_to_delete': messages_to_delete  # Pass the updated list
+                        'messages_to_delete': messages_to_delete
                     },
                     name=f'kick_user_{chat_id}_{user_id}'
                 )
@@ -791,7 +773,6 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
     user_name = job.data['user_name']
     captcha_message_id = job.data['captcha_message_id']
     strict_mode = job.data.get('strict_mode', False)
-    messages_to_delete = job.data.get('messages_to_delete', [])
 
     connection = get_db_connection()
     if connection is None:
@@ -805,9 +786,8 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
         pending_captcha = cursor.fetchone()
 
         if pending_captcha:
-            # Ensure the captcha message ID is in the list of messages to delete
-            if captcha_message_id not in messages_to_delete:
-                messages_to_delete.append(captcha_message_id)
+            messages_to_delete = json.loads(pending_captcha.get('messages_to_delete', '[]'))
+            messages_to_delete.append(captcha_message_id)
 
             try:
                 # Send a message right before kicking the user
@@ -878,6 +858,16 @@ def is_service_message(message: Message) -> bool:
             message.message_auto_delete_timer_changed or
             message.pinned_message)
 
+async def delete_welcome_message(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    chat_id, message_id = job.data['chat_id'], job.data['message_id']
+    
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        print(f"Welcome message (ID: {message_id}) deleted in chat {chat_id}")
+    except TelegramError as e:
+        print(f"Error deleting welcome message (ID: {message_id}) in chat {chat_id}: {e}")
+
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     join_message_id = update.message.message_id
@@ -899,6 +889,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             settings = cursor.fetchone()
             timeout = settings['timeout'] if settings and 'timeout' in settings else 60
             attempt_limit = settings['attempt_limit'] if settings and 'attempt_limit' in settings else 3
+            strict_mode = settings['strict_mode'] if settings else False
 
             # Get custom captcha if exists
             cursor.execute("SELECT * FROM captchas WHERE chat_id = %s", (chat_id,))
@@ -934,39 +925,21 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             connection.commit()
 
             # Schedule job to kick user if they don't answer in time
-            job = context.job_queue.run_once(
-                kick_user, 
-                timeout, 
-                data={
-                    'chat_id': chat_id, 
-                    'user_id': user_id, 
-                    'user_name': user_name,
-                    'captcha_message_id': captcha_message.message_id,
-                    'strict_mode': strict_mode
-                },
-                name=f'kick_user_{chat_id}_{user_id}'
-            )
-
-            # Store pending captcha in database
-            cursor.execute("""
-                INSERT INTO pending_captchas (user_id, chat_id, correct_answers, captcha_message_id, messages_to_delete, question)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (user_id, chat_id, ','.join(correct_answers), captcha_message.message_id, json.dumps([captcha_message.message_id]), question))
-            connection.commit()
-
-            # Schedule job to kick user if they don't answer in time
-            context.job_queue.run_once(
-                kick_user, 
-                timeout, 
-                data={
-                    'chat_id': chat_id, 
-                    'user_id': user_id, 
-                    'user_name': user_name,
-                    'captcha_message_id': captcha_message.message_id,
-                    'strict_mode': strict_mode
-                },
-                name=f'kick_user_{chat_id}_{user_id}'
-            )
+            if context.job_queue:
+                context.job_queue.run_once(
+                    kick_user, 
+                    timeout, 
+                    data={
+                        'chat_id': chat_id, 
+                        'user_id': user_id, 
+                        'user_name': user_name,
+                        'captcha_message_id': captcha_message.message_id,
+                        'strict_mode': strict_mode
+                    },
+                    name=f'kick_user_{chat_id}_{user_id}'
+                )
+            else:
+                print(f"Warning: Job queue is not available. Unable to schedule kick job for user {user_id} in chat {chat_id}")
 
             print(f"New member {user_name} (ID: {user_id}) joined chat {chat_id}. Captcha sent.")
 
@@ -983,7 +956,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await context.bot.delete_message(chat_id=chat_id, message_id=join_message_id)
     except TelegramError as e:
         print(f"Error deleting join message: {e}")
-
+        
 async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle captcha timeout."""
     job = context.job
@@ -1189,11 +1162,11 @@ def main() -> None:
         # Handle edited messages for commands
         application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.COMMAND, handle_edited_command))
 
-         # Schedule the cleanup job to run every hour
+        # Schedule the cleanup job to run every hour
         if job_queue:
             job_queue.run_repeating(cleanup_pending_captchas, interval=3600, first=10)
             # Schedule the group statistics update job to run once per day
-            job_queue.run_daily(update_group_statistics, time=datetime.time(hour=0, minute=0, tzinfo=pytz.UTC))
+            job_queue.run_daily(update_group_statistics, time=dt_time(0, 0, tzinfo=pytz.UTC))
         else:
             print("Warning: Job queue is not available. Scheduled tasks will not run.")
 
