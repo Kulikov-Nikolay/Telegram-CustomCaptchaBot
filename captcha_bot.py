@@ -34,7 +34,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
 # Set up logging
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-log_file = '/var/log/telegram-captcha-bot.log'
+log_file = '/var/log/telegram-captcha-bot/telegram-captcha-bot.log'
 log_handler = RotatingFileHandler(log_file, maxBytes=1024 * 1024 * 5, backupCount=5)  # 5MB file size, keep 5 backups
 log_handler.setFormatter(log_formatter)
 

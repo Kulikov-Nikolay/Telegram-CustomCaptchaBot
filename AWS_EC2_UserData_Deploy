@@ -37,6 +37,11 @@ EOT
 chmod 600 /opt/telegram-captcha-bot/.env
 chown ec2-user:ec2-user /opt/telegram-captcha-bot/.env
 
+# Create log directory and set permissions
+mkdir -p /var/log/telegram-captcha-bot
+chown ec2-user:ec2-user /var/log/telegram-captcha-bot
+chmod 755 /var/log/telegram-captcha-bot
+
 # Create the service file
 cat <<EOT > /etc/systemd/system/telegram-captcha-bot.service
 [Unit]
