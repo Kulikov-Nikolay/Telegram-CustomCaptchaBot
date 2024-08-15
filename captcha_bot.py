@@ -6,6 +6,8 @@ import traceback
 import logging
 import datetime
 import pytz
+import sys
+import signal
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue, CallbackQueryHandler
 from telegram.error import TelegramError, BadRequest
@@ -13,6 +15,7 @@ from telegram.constants import ParseMode
 from collections import defaultdict
 from datetime import time as dt_time
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 
 import os
 from dotenv import load_dotenv
@@ -29,7 +32,20 @@ DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 
+# Set up logging
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file = '/var/log/telegram-captcha-bot.log'
+log_handler = RotatingFileHandler(log_file, maxBytes=1024 * 1024 * 5, backupCount=5)  # 5MB file size, keep 5 backups
+log_handler.setFormatter(log_formatter)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+
+# Also add a StreamHandler for console output
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
 
 # Store pending captchas: {user_id: correct_answer}
 pending_captchas = {}
@@ -72,12 +88,37 @@ def get_db_connection():
         )
         return connection
     except Error as e:
-        print(f"Error connecting to MySQL database: {e}")
+        logger.error(f"Error connecting to MySQL database: {e}")
         return None
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+sys.excepthook = handle_exception
+
+def signal_handler(signum, frame):
+    logger.warning(f"Received signal {signum}. Shutting down gracefully...")
+    # Perform any cleanup here
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     await update.message.reply_text('Hi! I am a captcha bot.')
+
+async def watchdog(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        me = await context.bot.get_me()
+        logger.info(f"Bot is responsive. Username: {me.username}")
+    except Exception as e:
+        logger.error(f"Bot is not responsive: {e}")
+        # restart TBD
 
 async def get_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -99,7 +140,7 @@ async def get_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         
         await update.message.reply_text(f"The current captcha timeout is set to {timeout} seconds.")
     except Error as e:
-        print(f"Error getting timeout: {e}")
+        logger.error(f"Error getting timeout: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the timeout. Please try again later.")
     finally:
         cursor.close()
@@ -143,7 +184,7 @@ async def set_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         connection.commit()
         await message.reply_text(f"Captcha timeout set to {timeout} seconds.")
     except Error as e:
-        print(f"Error setting timeout: {e}")
+        logger.error(f"Error setting timeout: {e}")
         await message.reply_text("Sorry, there was a problem setting the timeout. Please try again later.")
     finally:
         cursor.close()
@@ -187,7 +228,7 @@ async def set_attempt_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         connection.commit()
         await message.reply_text(f"Captcha attempt limit set to {limit}.")
     except Error as e:
-        print(f"Error setting attempt limit: {e}")
+        logger.error(f"Error setting attempt limit: {e}")
         await message.reply_text("Sorry, there was a problem setting the attempt limit. Please try again later.")
     finally:
         cursor.close()
@@ -213,7 +254,7 @@ async def get_attempt_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         
         await update.message.reply_text(f"The current captcha attempt limit is set to {limit}.")
     except Error as e:
-        print(f"Error getting attempt limit: {e}")
+        logger.error(f"Error getting attempt limit: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the attempt limit. Please try again later.")
     finally:
         cursor.close()
@@ -247,7 +288,7 @@ async def set_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         connection.commit()
         await update.message.reply_text(f"Welcome message has been set to:\n\n{welcome_message}")
     except Error as e:
-        print(f"Error setting welcome message: {e}")
+        logger.error(f"Error setting welcome message: {e}")
         await update.message.reply_text("Sorry, there was a problem setting the welcome message. Please try again later.")
     finally:
         cursor.close()
@@ -272,7 +313,7 @@ async def get_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("No custom welcome message has been set for this chat. The default welcome message will be used.")
     except Error as e:
-        print(f"Error getting welcome message: {e}")
+        logger.error(f"Error getting welcome message: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the welcome message. Please try again later.")
     finally:
         cursor.close()
@@ -300,7 +341,7 @@ async def set_strict_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         connection.commit()
         await update.message.reply_text("Strict mode enabled. Users who fail the captcha will be permanently banned.")
     except Error as e:
-        print(f"Error setting strict mode: {e}")
+        logger.error(f"Error setting strict mode: {e}")
         await update.message.reply_text("Sorry, there was a problem enabling strict mode. Please try again later.")
     finally:
         cursor.close()
@@ -328,7 +369,7 @@ async def unset_strict_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         connection.commit()
         await update.message.reply_text("Strict mode disabled. Users who fail the captcha will be kicked but not banned.")
     except Error as e:
-        print(f"Error unsetting strict mode: {e}")
+        logger.error(f"Error unsetting strict mode: {e}")
         await update.message.reply_text("Sorry, there was a problem disabling strict mode. Please try again later.")
     finally:
         cursor.close()
@@ -392,7 +433,7 @@ Current settings for this chat:
 
         await update.message.reply_text(settings_message)
     except Error as e:
-        print(f"Error getting all settings: {e}")
+        logger.error(f"Error getting all settings: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the settings. Please try again later.")
     finally:
         cursor.close()
@@ -402,7 +443,7 @@ async def update_group_statistics(context: ContextTypes.DEFAULT_TYPE) -> None:
     bot = context.bot
     connection = get_db_connection()
     if connection is None:
-        print("Failed to connect to the database")
+        logger.error("Failed to connect to the database")
         return
 
     cursor = connection.cursor()
@@ -422,13 +463,13 @@ async def update_group_statistics(context: ContextTypes.DEFAULT_TYPE) -> None:
                     VALUES (%s, %s)
                 """, (chat_id, chat_member_count))
 
-                print(f"Updated statistics for chat {chat_id}: {chat_member_count} members")
+                logger.info(f"Updated statistics for chat {chat_id}: {chat_member_count} members")
             except TelegramError as e:
-                print(f"Error getting member count for chat {chat_id}: {e}")
+                logger.error(f"Error getting member count for chat {chat_id}: {e}")
 
         connection.commit()
     except Error as e:
-        print(f"Database error in update_group_statistics: {e}")
+        logger.error(f"Database error in update_group_statistics: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -468,7 +509,7 @@ async def set_open_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         connection.commit()
         await update.message.reply_text(f"Open-ended captcha set. Question: {question}\nPossible answers: {', '.join(answers)}")
     except Error as e:
-        print(f"Error setting open captcha: {e}")
+        logger.error(f"Error setting open captcha: {e}")
         await update.message.reply_text("Sorry, there was a problem setting the captcha. Please try again later.")
     finally:
         cursor.close()
@@ -510,7 +551,7 @@ async def set_multiple_captcha(update: Update, context: ContextTypes.DEFAULT_TYP
         connection.commit()
         await update.message.reply_text(f"Multiple-choice captcha set. Question: {question}\nCorrect answer: {correct_answer}\nAll options: {', '.join(all_answers)}")
     except Error as e:
-        print(f"Error setting multiple choice captcha: {e}")
+        logger.error(f"Error setting multiple choice captcha: {e}")
         await update.message.reply_text("Sorry, there was a problem setting the captcha. Please try again later.")
     finally:
         cursor.close()
@@ -550,7 +591,7 @@ async def set_welcome_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE
         connection.commit()
         await update.message.reply_text(f"Welcome message timeout set to {timeout} seconds.")
     except Error as e:
-        print(f"Error setting welcome timeout: {e}")
+        logger.error(f"Error setting welcome timeout: {e}")
         await update.message.reply_text("Sorry, there was a problem setting the welcome timeout. Please try again later.")
     finally:
         cursor.close()
@@ -576,7 +617,7 @@ async def get_welcome_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         await update.message.reply_text(f"The current welcome message timeout is set to {timeout} seconds.")
     except Error as e:
-        print(f"Error getting welcome timeout: {e}")
+        logger.error(f"Error getting welcome timeout: {e}")
         await update.message.reply_text("Sorry, there was a problem retrieving the welcome timeout. Please try again later.")
     finally:
         cursor.close()
@@ -588,9 +629,9 @@ async def delete_welcome_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        print(f"Welcome message (ID: {message_id}) deleted in chat {chat_id}")
+        logger.info(f"Welcome message (ID: {message_id}) deleted in chat {chat_id}")
     except TelegramError as e:
-        print(f"Error deleting welcome message (ID: {message_id}) in chat {chat_id}: {e}")
+        logger.error(f"Error deleting welcome message (ID: {message_id}) in chat {chat_id}: {e}")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -601,8 +642,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_id = int(data[1])
         answer = data[2]
 
+        logger.info(f"Received captcha answer from user {user_id}")
+
         connection = get_db_connection()
         if connection is None:
+            logger.error("Failed to connect to the database in button_callback")
             await query.edit_message_text("Sorry, there was a problem processing your response. Please try again later.")
             return
 
@@ -612,6 +656,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pending_captcha = cursor.fetchone()
 
             if not pending_captcha:
+                logger.warning(f"No pending captcha found for user {user_id}")
                 await query.edit_message_text("This captcha is no longer valid.")
                 return
 
@@ -627,6 +672,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             welcome_timeout = chat_settings['welcome_timeout'] if chat_settings else 10
 
             if answer.lower() in [ans.lower() for ans in correct_answers]:
+                logger.info(f"User {user_id} answered captcha correctly in chat {chat_id}")
                 welcome_msg = await query.edit_message_text(f"Correct! {welcome_message}")
                 cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
                 connection.commit()
@@ -644,11 +690,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     name=f'delete_welcome_{chat_id}_{user_id}'
                 )
             else:
+                logger.info(f"User {user_id} answered captcha incorrectly in chat {chat_id}")
                 new_attempts = pending_captcha['attempts'] + 1
                 cursor.execute("UPDATE pending_captchas SET attempts = %s WHERE user_id = %s", (new_attempts, user_id))
                 connection.commit()
 
                 if new_attempts >= attempt_limit:
+                    logger.info(f"User {user_id} exceeded attempt limit in chat {chat_id}")
                     # Schedule the kick job immediately
                     context.job_queue.run_once(
                         kick_user,
@@ -670,7 +718,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         reply_markup=query.message.reply_markup
                     )
         except Error as e:
-            print(f"Database error in button_callback: {e}")
+            logger.error(f"Database error in button_callback: {e}")
         finally:
             cursor.close()
             connection.close()
@@ -678,8 +726,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     
+    logger.info(f"Received text message from user {user_id}, checking if it's a captcha answer")
+
     connection = get_db_connection()
     if connection is None:
+        logger.error("Failed to connect to the database in check_captcha_answer")
         await update.message.reply_text("Sorry, there was a problem processing your response. Please try again later.")
         return
 
@@ -689,6 +740,7 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         pending_captcha = cursor.fetchone()
 
         if not pending_captcha:
+            logger.info(f"No pending captcha found for user {user_id}")
             return  # No pending captcha for this user
 
         chat_id = pending_captcha['chat_id']
@@ -707,6 +759,7 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         user_answer = update.message.text.strip().lower()
 
         if user_answer in [ans.lower() for ans in correct_answers]:
+            logger.info(f"User {user_id} answered captcha correctly in chat {chat_id}")
             success_message = await update.message.reply_text(f"Correct! {welcome_message}")
             messages_to_delete.append(success_message.message_id)
             cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
@@ -733,9 +786,11 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
                 name=f'delete_captcha_{chat_id}_{user_id}'
             )
         else:
+            logger.info(f"User {user_id} answered captcha incorrectly in chat {chat_id}")
             new_attempts = pending_captcha['attempts'] + 1
             
             if new_attempts >= attempt_limit:
+                logger.info(f"User {user_id} exceeded attempt limit in chat {chat_id}")
                 # Schedule the kick job immediately
                 context.job_queue.run_once(
                     kick_user,
@@ -761,7 +816,7 @@ async def check_captcha_answer(update: Update, context: ContextTypes.DEFAULT_TYP
                 connection.commit()
 
     except Error as e:
-        print(f"Database error in check_captcha_answer: {e}")
+        logger.error(f"Database error in check_captcha_answer: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -774,9 +829,11 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
     captcha_message_id = job.data['captcha_message_id']
     strict_mode = job.data.get('strict_mode', False)
 
+    logger.info(f"Attempting to kick user {user_id} from chat {chat_id}")
+
     connection = get_db_connection()
     if connection is None:
-        print(f"Failed to connect to the database while trying to kick user {user_id} from chat {chat_id}")
+        logger.error(f"Failed to connect to the database while trying to kick user {user_id} from chat {chat_id}")
         return
 
     cursor = connection.cursor(dictionary=True)
@@ -802,6 +859,8 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await context.bot.unban_chat_member(chat_id, user_id)
                     action_text = "removed"
 
+                logger.info(f"User {user_id} has been {action_text} from chat {chat_id}")
+
                 # Wait a moment for the system message to appear
                 await asyncio.sleep(1)
 
@@ -817,7 +876,7 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
                     try:
                         await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
                     except TelegramError as e:
-                        print(f"Error deleting message {msg_id}: {e}")
+                        logger.error(f"Error deleting message {msg_id}: {e}")
 
                 # Send a temporary notification about the action taken
                 action_message = await context.bot.send_message(
@@ -830,15 +889,16 @@ async def kick_user(context: ContextTypes.DEFAULT_TYPE) -> None:
                 # Remove the pending captcha from the database
                 cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s AND chat_id = %s", (user_id, chat_id))
                 connection.commit()
+                logger.info(f"Removed pending captcha for user {user_id} in chat {chat_id}")
 
             except TelegramError as e:
-                print(f"Error kicking/banning user {user_id} from chat {chat_id}: {e}")
+                logger.error(f"Error kicking/banning user {user_id} from chat {chat_id}: {e}")
 
         else:
-            print(f"Kick job ran for user {user_id} in chat {chat_id}, but they were not in pending_captchas.")
+            logger.warning(f"Kick job ran for user {user_id} in chat {chat_id}, but they were not in pending_captchas.")
 
     except Error as e:
-        print(f"Database error in kick_user: {e}")
+        logger.error(f"Database error in kick_user: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -864,17 +924,19 @@ async def delete_welcome_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        print(f"Welcome message (ID: {message_id}) deleted in chat {chat_id}")
+        logger.info(f"Welcome message (ID: {message_id}) deleted in chat {chat_id}")
     except TelegramError as e:
-        print(f"Error deleting welcome message (ID: {message_id}) in chat {chat_id}: {e}")
+        logger.error(f"Error deleting welcome message (ID: {message_id}) in chat {chat_id}: {e}")
 
 async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     join_message_id = update.message.message_id
     
+    logger.info(f"New member(s) joined chat {chat_id}. Message ID: {join_message_id}")
+
     connection = get_db_connection()
     if connection is None:
-        print("Failed to connect to the database")
+        logger.error("Failed to connect to the database")
         return
 
     cursor = connection.cursor(dictionary=True)
@@ -882,6 +944,8 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     for new_member in update.message.new_chat_members:
         user_id = new_member.id
         user_name = new_member.full_name
+
+        logger.info(f"Processing new member: {user_name} (ID: {user_id})")
 
         try:
             # Get chat settings
@@ -901,6 +965,7 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     captcha_text = f"Welcome {user_name}!\n\nPlease answer this captcha within {timeout} seconds: {question}"
                     correct_answers = answers.split(',')
                     reply_markup = None
+                    logger.info(f"Open captcha sent for {user_name} (ID: {user_id}) in chat {chat_id}")
                 elif mode == "multiple":
                     all_answers = answers.split(',')
                     correct_answer = all_answers[0]  # Assuming the first answer is correct
@@ -909,11 +974,13 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     keyboard = [[InlineKeyboardButton(answer, callback_data=f"captcha:{user_id}:{answer}")] for answer in all_answers]
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     correct_answers = [correct_answer]
+                    logger.info(f"Multiple options captcha sent for {user_name} (ID: {user_id}) in chat {chat_id}")
             else:
                 question = "What is 2+2?"
                 correct_answers = ["4", "four"]
                 captcha_text = f"Welcome {user_name}!\n\nPlease answer this captcha within {timeout} seconds: {question}"
                 reply_markup = None
+                logger.info(f"Default captcha sent for {user_name} (ID: {user_id}) in chat {chat_id}")
 
             captcha_message = await context.bot.send_message(chat_id=chat_id, text=captcha_text, reply_markup=reply_markup)
 
@@ -939,14 +1006,14 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     name=f'kick_user_{chat_id}_{user_id}'
                 )
             else:
-                print(f"Warning: Job queue is not available. Unable to schedule kick job for user {user_id} in chat {chat_id}")
+                logger.warning(f"Warning: Job queue is not available. Unable to schedule kick job for user {user_id} in chat {chat_id}")
 
-            print(f"New member {user_name} (ID: {user_id}) joined chat {chat_id}. Captcha sent.")
+            logger.info(f"New member {user_name} (ID: {user_id}) joined chat {chat_id}. Captcha sent.")
 
         except Error as e:
-            print(f"Database error in handle_new_member: {e}")
+            logger.error(f"Database error in handle_new_member: {e}")
         except TelegramError as e:
-            print(f"Telegram error in handle_new_member: {e}")
+            logger.error(f"Telegram error in handle_new_member: {e}")
 
     cursor.close()
     connection.close()
@@ -954,8 +1021,9 @@ async def handle_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Try to delete the join message
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=join_message_id)
+        logger.info(f"Deleted join message (ID: {join_message_id}) in chat {chat_id}")
     except TelegramError as e:
-        print(f"Error deleting join message: {e}")
+        logger.error(f"Error deleting join message: {e}")
         
 async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle captcha timeout."""
@@ -972,17 +1040,17 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.unban_chat_member(chat_id, user_id)  # Immediately unban to allow rejoining
                 await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, 
                                                     text=f"{user_name} has been removed for not completing the captcha within {timeout} seconds.")
-                print(f"User {user_id} kicked from chat {chat_id} due to captcha timeout after {timeout} seconds.")
+                logger.info(f"User {user_id} kicked from chat {chat_id} due to captcha timeout after {timeout} seconds.")
             else:
-                print(f"User {user_id} already left chat {chat_id} before captcha timeout of {timeout} seconds.")
+                logger.warning(f"User {user_id} already left chat {chat_id} before captcha timeout of {timeout} seconds.")
         except TelegramError as e:
-            print(f"Error kicking user {user_id} from chat {chat_id} after {timeout} seconds: {e}")
+            logger.error(f"Error kicking user {user_id} from chat {chat_id} after {timeout} seconds: {e}")
             if "Not enough rights" in str(e):
                 await context.bot.send_message(chat_id, "I don't have permission to remove users. Please give me the necessary rights.")
         except Exception as e:
-            print(f"Unexpected error kicking user {user_id} from chat {chat_id} after {timeout} seconds: {e}")
+            logger.error(f"Unexpected error kicking user {user_id} from chat {chat_id} after {timeout} seconds: {e}")
     else:
-        print(f"User {user_id} not found in pending_captchas for chat {chat_id} after {timeout} seconds. They might have already answered correctly.")
+        logger.warning(f"User {user_id} not found in pending_captchas for chat {chat_id} after {timeout} seconds. They might have already answered correctly.")
 
 async def delete_captcha_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
@@ -994,9 +1062,9 @@ async def delete_captcha_messages(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except TelegramError as e:
-            print(f"Error deleting message {msg_id} in chat {chat_id}: {e}")
+            logger.error(f"Error deleting message {msg_id} in chat {chat_id}: {e}")
 
-    print(f"Deleted all captcha-related messages for user {user_id} in chat {chat_id}")
+    logger.info(f"Deleted all captcha-related messages for user {user_id} in chat {chat_id}")
 
 async def check_permissions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Check the bot's permissions in the chat."""
@@ -1071,6 +1139,7 @@ Tips:
 - Test your settings by having a non-admin account join the group.
 - Adjust the timeouts based on the difficulty of your captcha and your group's needs.
 
+To review source code, documentation and other information please visit https://github.com/Kulikov-Nikolay/Telegram-CustomCaptchaBot
 For any issues or further assistance, please contact the bot developer @KulikovNikolay.
 """
     await update.message.reply_text(help_text)
@@ -1091,7 +1160,7 @@ async def handle_edited_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def cleanup_pending_captchas(context: ContextTypes.DEFAULT_TYPE) -> None:
     connection = get_db_connection()
     if connection is None:
-        print("Failed to connect to the database during cleanup")
+        logger.error("Failed to connect to the database during cleanup")
         return
 
     cursor = connection.cursor()
@@ -1110,11 +1179,11 @@ async def cleanup_pending_captchas(context: ContextTypes.DEFAULT_TYPE) -> None:
             
             if not jobs:  # If no active kick job, it's safe to delete
                 cursor.execute("DELETE FROM pending_captchas WHERE user_id = %s", (user_id,))
-                print(f"Cleaned up pending captcha for user {user_id} in chat {chat_id}")
+                logger.info(f"Cleaned up pending captcha for user {user_id} in chat {chat_id}")
         
         connection.commit()
     except Error as e:
-        print(f"Error during cleanup of pending captchas: {e}")
+        logger.error(f"Error during cleanup of pending captchas: {e}")
     finally:
         cursor.close()
         connection.close()
@@ -1125,9 +1194,12 @@ logger = logging.getLogger(__name__)
 
 def main() -> None:
     """Start the bot."""
+    logger.info("Bot is starting...")
     try:
         # Create the Application and pass it your bot's token.
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+        logging.getLogger('httpx').setLevel(logging.INFO)
 
         # Set up the job queue
         job_queue = application.job_queue
@@ -1168,15 +1240,21 @@ def main() -> None:
             # Schedule the group statistics update job to run once per day
             job_queue.run_daily(update_group_statistics, time=dt_time(0, 0, tzinfo=pytz.UTC))
         else:
-            print("Warning: Job queue is not available. Scheduled tasks will not run.")
+            logger.warning("Warning: Job queue is not available. Scheduled tasks will not run.")
 
         # Start the Bot
-        print("Starting the bot...")
+        logger.info("Starting the bot...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Watchdog
+        job_queue.run_repeating(watchdog, interval=900)  # Check every 15 minutes
+
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
-        print(f"Error starting the bot: {e}")
-        raise  # Re-raise the exception to ensure the service fails and logs the error
+        logger.error(f"Error in main loop: {e}")
+    finally:
+        logger.info("Bot is shutting down...")
 
 if __name__ == '__main__':
     main()
